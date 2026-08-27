@@ -3,12 +3,17 @@ import { v4 as uuidv4 } from "uuid";
 import { config } from "./config";
 import { RateLimiter } from "./tokenBucket";
 import { validateLog } from "./validation";
+import { RawLogChannel } from "./channel";
+import { enrichLog } from "./enrichment";
 
 const app = express();
 // Enforce payload size limit (1MB) and JSON parsing
 app.use(express.json({ limit: config.maxPayLoadSize }));
 
 const rateLimiter = new RateLimiter(config.rateLimit);
+
+// create rawlog channel
+const rawLogChannel = new RawLogChannel(config.channelBufferSize);
 
 // Error handler for malformed JSON / payload too large
 app.use(
@@ -62,6 +67,11 @@ app.post("/logs", (req, res) => {
   for (const item of body) {
     const result = validateLog(item);
     if (result.valid) {
+      // push to raw chamnnel instead of accepting
+      const pushed = rawLogChannel.push({ log: result.log, sourceIp: ip });
+      if (!pushed) {
+        return res.status(503).json({ error: "ingestion overload" });
+      }
       accepted.push(result.log);
     } else {
       rejected.push({ entry: item, errors: result.errors });
@@ -76,6 +86,19 @@ app.post("/logs", (req, res) => {
     rejected,
   });
 });
+async function startConsumer() {
+  while (true) {
+    const batch = await rawLogChannel.popBatch(config.consumerBatchSize, 100);
+    if (batch.length > 0) {
+      for (const item of batch) {
+        const enriched = enrichLog(item.log, item.sourceIp, config.env);
+        console.log("Enriched log:", enriched);
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+startConsumer().catch(console.error);
 
 app.listen(config.port, () => {
   console.log(`Log ingestion server running on port ${config.port}`);
