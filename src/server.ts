@@ -5,31 +5,19 @@ import { RateLimiter } from './tokenBucket';
 import { validateLog } from './validation';
 import { RawLogChannel } from './channel';
 import { enrichLog } from './enrichment';
-// NEW: import new modules
-import { RabbitMQClient } from './rabbitmq';   
-import { SQLiteWriter } from './sqlite';       
-import { DeadLetter } from './deadLetter';     
+import { RabbitMQClient } from './rabbitmq';
+import { SQLiteWriter } from './sqlite';
+import { DeadLetter } from './deadLetter';
+import { Metrics } from './metrics';   
 
 const app = express();
 app.use(express.json({ limit: config.maxPayLoadSize }));
 
 const rateLimiter = new RateLimiter(config.rateLimit);
 const rawChannel = new RawLogChannel(config.channelBufferSize);
-
-//  instantiating RabbitMQ client and DeadLetter
-const rabbit = new RabbitMQClient();           
-const deadLetter = new DeadLetter();           
-
-// Error handler (unchanged)
-app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  if (err.type === 'entity.too.large') {
-    return res.status(413).json({ error: 'Payload Too Large' });
-  }
-  if (err instanceof SyntaxError && 'body' in err) {
-    return res.status(400).json({ error: 'Malformed JSON' });
-  }
-  next(err);
-});
+const rabbit = new RabbitMQClient();
+const deadLetter = new DeadLetter();
+const metrics = new Metrics();  
 
 app.post('/logs', (req, res) => {
   const contentType = req.headers['content-type'] || '';
@@ -77,44 +65,89 @@ app.post('/logs', (req, res) => {
   });
 });
 
+//  GET /metrics endpoint
+app.get('/metrics', (req, res) => {   
+  metrics.queueBacklog = rabbit.getBacklogSize();   
+  res.json(metrics.snapshot());   
+});   
+
+// GET /dashboard endpoint 
+app.get('/dashboard', (req, res) => {   
+  metrics.queueBacklog = rabbit.getBacklogSize();   
+  const snap = metrics.snapshot();  
+  const topServices = Object.entries(snap.logs_by_service)   
+    .sort((a, b) => b[1] - a[1])   
+    .slice(0, 5)   
+    .map(([svc, count]) => `<li>${svc}: ${count}</li>`)   
+    .join('');   
+
+  const html = `   
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Log Ingestion Dashboard</title>
+  <meta http-equiv="refresh" content="5">
+  <style>
+    body { font-family: sans-serif; margin: 2rem; }
+    .metric { display: inline-block; margin: 1rem; padding: 1rem; border: 1px solid #ccc; border-radius: 8px; min-width: 150px; }
+    .value { font-size: 2rem; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Log Ingestion Dashboard</h1>
+  <div class="metric"><div>Total Logs</div><div class="value">${snap.total_logs}</div></div>
+  <div class="metric"><div>Throughput</div><div class="value">${snap.throughput.toFixed(2)} logs/sec</div></div>
+  <div class="metric"><div>Error Rate</div><div class="value">${snap.error_rate.toFixed(2)}%</div></div>
+  <div class="metric"><div>Queue Backlog</div><div class="value">${snap.queue_backlog}</div></div>
+  <h2>Top 5 Services</h2>
+  <ul>${topServices || '<li>No data</li>'}</ul>
+  <p>Auto-refreshes every 5 seconds</p>
+</body>
+</html>`;   
+  res.send(html);   
+});  
+
+// Router consumer: record metrics after enrichment
 async function startRouterConsumer() {
   while (true) {
     const batch = await rawChannel.popBatch(config.consumerBatchSize, 100);
     for (const item of batch) {
       const enriched = enrichLog(item.log, item.sourceIp, config.env);
-      await rabbit.publish(enriched.service, enriched);     // NEW
+      // record metrics for each enriched log
+      metrics.record(enriched);   
+      await rabbit.publish(enriched.service, enriched);
     }
     await new Promise(resolve => setTimeout(resolve, 10));
   }
 }
 
-// Storage consumer: reads from RabbitMQ (or fallback), writes to SQLite with retry
+// Storage consumers 
 async function startStorageConsumer(service: string) {
-  const writer = new SQLiteWriter(service);                 
-  const backoff = [1000, 5000, 10000];                      
+  const writer = new SQLiteWriter(service);
+  const backoff = [1000, 5000, 10000];
   while (true) {
-    const batch = await rabbit.popBatch(service, config.storageBatchSize, config.storageBatchTimeoutMs); // NEW
+    const batch = await rabbit.popBatch(service, config.storageBatchSize, config.storageBatchTimeoutMs);
     if (batch.length === 0) continue;
 
     let success = false;
     let retries = 0;
-    while (!success && retries < 3) {                      
+    while (!success && retries < 3) {
       try {
-        await writer.writeBatch(batch);                     
+        await writer.writeBatch(batch);
         success = true;
       } catch (err) {
         retries++;
         console.error(`Write failed for ${service}, retry ${retries}/3:`, err);
         if (retries < 3) {
-          await new Promise(resolve => setTimeout(resolve, backoff[retries - 1])); // NEW
+          await new Promise(resolve => setTimeout(resolve, backoff[retries - 1]));
         }
       }
     }
 
-    if (!success) {                                        
+    if (!success) {
       console.error(`All retries failed for ${service}. Sending to dead letter.`);
       for (const log of batch) {
-        await deadLetter.append({                          
+        await deadLetter.append({
           log,
           error: 'All retries failed',
           timestamp: new Date().toISOString(),
@@ -124,13 +157,12 @@ async function startStorageConsumer(service: string) {
   }
 }
 
-//  Initialize RabbitMQ, start consumers
 async function main() {
-  await rabbit.connect();                                  
+  await rabbit.connect();
 
-  startRouterConsumer();                                    
-  for (const service of config.services) {                  
-    startStorageConsumer(service);                          
+  startRouterConsumer();
+  for (const service of config.services) {
+    startStorageConsumer(service);
   }
 
   app.listen(config.port, () => {
@@ -138,4 +170,4 @@ async function main() {
   });
 }
 
-main().catch(console.error);                
+main().catch(console.error);
